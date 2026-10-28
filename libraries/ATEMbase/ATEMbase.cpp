@@ -319,6 +319,13 @@ bool ATEMbase::isConnected()	{
 }
 
 /**
+ * Time (millis) of the last packet received from the switcher
+ */
+unsigned long ATEMbase::getLastContact()	{
+	return _lastContact;
+}
+
+/**
  * If true, the initial handshake and "stressful" information exchange has occured and now the switcher connection should be ready for operation. 
  */
 bool ATEMbase::hasInitialized()	{

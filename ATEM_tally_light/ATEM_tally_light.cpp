@@ -56,6 +56,10 @@
 #include <TallyServer.h>
 #include <FastLED.h>
 
+#ifdef M5STICKC
+#include <M5Unified.h>
+#endif
+
 #ifdef ESP32
 //Define LED1 color pins
 #ifndef PIN_RED1
@@ -193,6 +197,7 @@ struct Settings {
 Settings settings;
 
 bool firstRun = true;
+bool wifiConnectedOnce = false; //softAP for setup is only served if WiFi can't be found after power on
 
 int bytesAvailable = false;
 uint8_t readByte;
@@ -203,6 +208,359 @@ uint8_t readByte;
 // bool lowLedOn = false;
 // double uBatt = 0;
 // char buffer[3];
+
+#ifdef M5STICKC
+//Built-in red LED: GPIO10 (active low) on M5StickC / Plus, GPIO19 (active high) on Plus2
+int m5LedPin = 10;
+bool m5LedActiveLow = true;
+
+M5Canvas m5Canvas(&M5.Display);
+uint8_t m5Color = LED_OFF;
+String m5Status = "";
+bool m5Dirty = true;
+unsigned long m5InfoUntil = 0;
+unsigned long m5InfoDrawn = 0;
+unsigned long m5LastPowerLog = 0;
+int m5BatteryLevel = -1;
+bool m5Charging = false;
+float m5BatteryMv = 0; //Smoothed battery voltage, WiFi transmit spikes make single readings jump
+unsigned long m5LastBatteryCheck = 0;
+
+#define M5_CHARGE_CURRENT_MA    450
+#define M5_CHARGE_VOLTAGE_MV    4200
+uint8_t m5ChargeRegBefore = 0;
+
+//The AXP192 reads lower than a multimeter on the battery (calibrated: 3.770 V shown vs 3.807 V measured)
+#define M5_BATTERY_OFFSET_MV    37
+
+//Li-ion voltage (mV) at 100, 95, 90 ... 0 %. M5Unified uses a straight line from 3.3 to 4.15 V,
+//which shows ~60 % at 3.8 V where the cell actually has ~40 % left.
+const uint16_t m5BatteryCurve[] = { 4200, 4150, 4110, 4080, 4020, 3980, 3950, 3910, 3870, 3850, 3840,
+                                    3820, 3800, 3790, 3770, 3750, 3730, 3710, 3690, 3610, 3270 };
+#define M5_BATTERY_CURVE_POINTS (sizeof(m5BatteryCurve) / sizeof(m5BatteryCurve[0]))
+
+int m5BatteryPercent(float mv) {
+    if (mv >= m5BatteryCurve[0]) return 100;
+    for (unsigned int i = 1; i < M5_BATTERY_CURVE_POINTS; i++) {
+        if (mv >= m5BatteryCurve[i]) {
+            float fraction = (mv - m5BatteryCurve[i]) / (m5BatteryCurve[i - 1] - m5BatteryCurve[i]);
+            return round(100 - 5 * i + 5 * fraction);
+        }
+    }
+    return 0;
+}
+int m5Rssi = 0;
+unsigned long m5LastRssiCheck = 0;
+unsigned long m5ChannelUntil = 0; //Show tally number for a moment after changing channel, even while connecting
+unsigned long m5SaveAt = 0;       //Delayed EEPROM save after channel change, to limit flash wear
+
+//Early warnings, shown before the connection is considered lost (WiFi after a few seconds, ATEM after 5 s).
+//Tally server clients get keep-alives every 1.5 s, so the no-data threshold must be above that.
+#define M5_NO_DATA_WARNING_MS   2500
+#define M5_WEAK_SIGNAL_DBM      -80
+bool m5NoData = false;     //No packets from switcher for a while - blinking frame around the screen
+bool m5WeakSignal = false; //Signal below M5_WEAK_SIGNAL_DBM - blinking signal indicator
+bool m5WarnPhase = false;
+
+void m5SetBuiltinLed(bool on) {
+    digitalWrite(m5LedPin, on != m5LedActiveLow);
+}
+
+void m5Begin() {
+    auto cfg = M5.config();
+    cfg.serial_baudrate = 0; //Serial is started in setup()
+    M5.begin(cfg);
+
+    if (M5.getBoard() == m5::board_t::board_M5StickCPlus2) {
+        m5LedPin = 19;
+        m5LedActiveLow = false;
+    }
+    pinMode(m5LedPin, OUTPUT);
+    m5SetBuiltinLed(false);
+
+    //M5StickC / Plus charge their battery through the AXP192. M5Unified leaves its charge settings untouched,
+    //which suits the stock 80-120 mAh cell. A large replacement cell (here: iPhone 13 mini, 2406 mAh) needs more
+    //current, or the AXP192 charge timer (7-10 h) stops before it is full.
+    //450 mA charges it in about 6 h without overheating the linear charger inside the case.
+    //4.2 V is a safe charge voltage for any Li-ion cell (HV cells like the iPhone one just use ~85% of capacity).
+    if (M5.Power.getType() == m5::Power_Class::pmic_axp192) {
+        m5ChargeRegBefore = M5.Power.Axp192.readRegister8(0x33);
+        M5.Power.setChargeVoltage(M5_CHARGE_VOLTAGE_MV);
+        M5.Power.setChargeCurrent(M5_CHARGE_CURRENT_MA);
+    }
+
+    M5.Display.setRotation(1);
+    m5Canvas.setColorDepth(16);
+    m5Canvas.createSprite(M5.Display.width(), M5.Display.height());
+}
+
+void m5SetColor(uint8_t color) {
+    if (color != m5Color) {
+        m5Color = color;
+        m5Dirty = true;
+    }
+}
+
+void m5SetStatus(String status) {
+    if (status != m5Status) {
+        m5Status = status;
+        m5Dirty = true;
+    }
+}
+
+//Draw lines separated by '\n' centered in the area from 'top' to the bottom of the screen,
+//scaled down to fit (but never larger than maxSize)
+void m5DrawFitted(const lgfx::IFont *font, String text, float maxSize, int top) {
+    m5Canvas.setFont(font);
+    m5Canvas.setTextSize(1);
+
+    int lines = 0, widest = 1, start = 0;
+    while (start <= (int)text.length()) {
+        int end = text.indexOf('\n', start);
+        if (end < 0) end = text.length();
+        widest = max(widest, (int)m5Canvas.textWidth(text.substring(start, end)));
+        lines++;
+        start = end + 1;
+    }
+
+    float size = maxSize;
+    size = min(size, (float)(m5Canvas.width() - 6) / widest);
+    size = min(size, (float)(m5Canvas.height() - top - 2) / (lines * m5Canvas.fontHeight()));
+    m5Canvas.setTextSize(size);
+    m5Canvas.setTextDatum(middle_center);
+
+    int lineHeight = m5Canvas.fontHeight();
+    int y = (top + m5Canvas.height()) / 2 - (lines - 1) * lineHeight / 2;
+    start = 0;
+    while (start <= (int)text.length()) {
+        int end = text.indexOf('\n', start);
+        if (end < 0) end = text.length();
+        m5Canvas.drawString(text.substring(start, end), m5Canvas.width() / 2, y);
+        y += lineHeight;
+        start = end + 1;
+    }
+    m5Canvas.setTextSize(1);
+}
+
+//Battery current (+ charging, - discharging) and USB input, measured by the AXP192
+String m5PowerInfo() {
+    if (M5.Power.getType() != m5::Power_Class::pmic_axp192) {
+        return m5Charging ? "Charging" : "";
+    }
+    int current = M5.Power.getBatteryCurrent();
+    String info = "Curr: " + String(current > 0 ? "+" : "") + String(current) + "mA";
+    float usbVoltage = M5.Power.Axp192.getVBUSVoltage();
+    if (usbVoltage > 4.0) {
+        info += " USB " + String(usbVoltage, 2) + "V " + String((int)M5.Power.Axp192.getVBUSCurrent()) + "mA";
+    }
+    return info;
+}
+
+void m5DrawInfo(float scale) {
+    m5Canvas.fillScreen(TFT_BLACK);
+    m5Canvas.setTextColor(TFT_WHITE);
+    m5Canvas.setTextDatum(top_left);
+    m5Canvas.setFont(scale > 1.2 ? (const lgfx::IFont *)&fonts::Font2 : (const lgfx::IFont *)&fonts::Font0);
+
+    bool apMode = WiFi.getMode() & WIFI_AP;
+    String info = (String)settings.tallyName + "  #" + (settings.tallyNo + 1) + "\n";
+    info += "IP:   " + (apMode && WiFi.status() != WL_CONNECTED ? WiFi.softAPIP() : WiFi.localIP()).toString() + "\n";
+    info += "WiFi: " + getSSID() + (WiFi.status() == WL_CONNECTED ? " (" + String(WiFi.RSSI()) + " dBm)" : " --") + "\n";
+#ifndef TALLY_TEST_SERVER
+    info += "ATEM: " + settings.switcherIP.toString() + (atemSwitcher.isConnected() ? " OK" : " --") + "\n";
+#endif
+    info += "Batt: " + String(m5BatteryLevel) + "% " + String(m5BatteryMv / 1000.0, 2) + "V\n";
+    info += m5PowerInfo() + "\n";
+    info += "Ver:  " VERSION;
+
+    int lineHeight = m5Canvas.fontHeight() + 2;
+    int y = 2, start = 0;
+    while (start < (int)info.length()) {
+        int end = info.indexOf('\n', start);
+        if (end < 0) end = info.length();
+        m5Canvas.drawString(info.substring(start, end), 4, y);
+        y += lineHeight;
+        start = end + 1;
+    }
+}
+
+void m5Draw() {
+    m5Dirty = false;
+    float scale = m5Canvas.height() / 80.0f; //80 px on M5StickC, 135 px on Plus / Plus2
+
+    if (m5InfoUntil) {
+        m5InfoDrawn = millis();
+        m5DrawInfo(scale);
+        m5Canvas.pushSprite(0, 0);
+        return;
+    }
+
+    CRGB bg = color_led[m5Color];
+    m5Canvas.fillScreen(m5Canvas.color565(bg.r, bg.g, bg.b));
+    bool brightBg = m5Color == LED_GREEN || m5Color == LED_YELLOW || m5Color == LED_WHITE || m5Color == LED_ORANGE;
+    m5Canvas.setTextColor(brightBg ? TFT_BLACK : TFT_WHITE);
+
+    //Top line: name and battery level
+    m5Canvas.setFont(scale > 1.2 ? (const lgfx::IFont *)&fonts::Font2 : (const lgfx::IFont *)&fonts::Font0);
+    m5Canvas.setTextSize(1);
+    m5Canvas.setTextDatum(top_left);
+    int fh = m5Canvas.fontHeight();
+    int x = m5Canvas.width() - 3;
+
+    //Battery level
+    m5Canvas.setTextDatum(top_right);
+    if (m5BatteryLevel >= 0) {
+        m5Canvas.drawString((m5Charging ? "+" : "") + String(m5BatteryLevel) + "%", x, 2);
+        x -= m5Canvas.textWidth("+100%") + 4;
+    }
+
+    //WiFi signal bars, filled bars in text color, empty bars dimmed
+    uint32_t fg = brightBg ? 0x000000 : 0xFFFFFF;
+    uint16_t barOn = m5Canvas.color565((fg >> 16) & 0xFF, (fg >> 8) & 0xFF, fg & 0xFF);
+    uint16_t barOff = m5Canvas.color565((((fg >> 16) & 0xFF) + bg.r) / 2, (((fg >> 8) & 0xFF) + bg.g) / 2, ((fg & 0xFF) + bg.b) / 2);
+    int bars = m5Rssi == 0 ? 0 : m5Rssi >= -55 ? 4 : m5Rssi >= -65 ? 3 : m5Rssi >= -75 ? 2 : m5Rssi >= -85 ? 1 : 0;
+    int barWidth = max(2, fh / 4);
+    bool showSignal = !(m5WeakSignal && m5WarnPhase);
+    x -= 4 * (barWidth + 1);
+    for (int i = 0; showSignal && i < 4; i++) {
+        int barHeight = fh * (i + 1) / 4;
+        m5Canvas.fillRect(x + i * (barWidth + 1), 2 + fh - barHeight, barWidth, barHeight, i < bars ? barOn : barOff);
+    }
+    x -= 3;
+    if (showSignal) {
+        m5Canvas.drawString(m5Rssi == 0 ? String("--") : String(m5Rssi) + "dBm", x, 2);
+    }
+    x -= m5Canvas.textWidth("-100dBm") + 3;
+
+    //Tally name, clipped so it doesn't overlap the status icons
+    m5Canvas.setTextDatum(top_left);
+    m5Canvas.setClipRect(0, 0, max(x, 0), fh + 4);
+    m5Canvas.drawString(settings.tallyName, 3, 2);
+    m5Canvas.clearClipRect();
+
+    //Main area below the top line
+    int top = fh + 4;
+    if (m5ChannelUntil || (m5Status.length() == 0 && settings.tallyModeLED1 != MODE_ON_AIR)) { //Tally number
+        m5DrawFitted(&fonts::Font7, String(settings.tallyNo + 1), scale, top);
+    } else if (m5Status.length() > 0) { //Connection status
+        m5DrawFitted(&fonts::FreeSansBold9pt7b, m5Status, scale, top);
+    } else {
+        m5DrawFitted(&fonts::FreeSansBold18pt7b, "ON AIR", scale, top);
+    }
+
+    //Blinking frame: tally state on screen may be outdated
+    if (m5NoData && m5WarnPhase) {
+        int t = max(3, m5Canvas.height() / 20);
+        for (int i = 0; i < t; i++) {
+            m5Canvas.drawRect(i, i, m5Canvas.width() - 2 * i, m5Canvas.height() - 2 * i, barOn);
+        }
+    }
+
+    m5Canvas.pushSprite(0, 0);
+}
+
+//Step tally number up or down, wrapping around the available sources
+void m5ChangeChannel(int delta) {
+    int maxNo = TALLY_SERVER_MAX_TALLY_FLAGS;
+#ifndef TALLY_TEST_SERVER
+    if (atemSwitcher.isConnected() && atemSwitcher.getTallyByIndexSources() > 0) {
+        maxNo = min((int)atemSwitcher.getTallyByIndexSources(), maxNo);
+    }
+#endif
+    settings.tallyNo = ((settings.tallyNo + delta) % maxNo + maxNo) % maxNo;
+
+    m5ChannelUntil = millis() + 2000;
+    m5SaveAt = millis() + 3000;
+    m5InfoUntil = 0;
+    m5Dirty = true;
+    Serial.println("Tally number changed to " + String(settings.tallyNo + 1));
+}
+
+void m5Loop() {
+    M5.update();
+
+    if (M5.BtnA.wasHold()) { //Show info screen for 5 seconds
+        m5InfoUntil = millis() + 5000;
+        m5Dirty = true;
+    } else if (M5.BtnA.wasClicked()) {
+        m5ChangeChannel(1);
+    } else if (M5.BtnB.wasClicked()) {
+        m5ChangeChannel(-1);
+    }
+
+    if (m5InfoUntil && (long)(millis() - m5InfoUntil) >= 0) {
+        m5InfoUntil = 0;
+        m5Dirty = true;
+    } else if (m5InfoUntil && millis() - m5InfoDrawn >= 1000) { //Keep currents on the info screen live
+        m5Dirty = true;
+    }
+
+    if (millis() - m5LastPowerLog >= 30000) {
+        m5LastPowerLog = millis();
+        Serial.println("Battery: " + String(m5BatteryLevel) + "% " + String(m5BatteryMv / 1000.0, 3) + "V " + m5PowerInfo());
+    }
+    if (m5ChannelUntil && (long)(millis() - m5ChannelUntil) >= 0) {
+        m5ChannelUntil = 0;
+        m5Dirty = true;
+    }
+
+    if (m5SaveAt && (long)(millis() - m5SaveAt) >= 0) {
+        m5SaveAt = 0;
+        EEPROM.put(0, settings);
+        EEPROM.commit();
+        Serial.println("Tally number saved");
+    }
+
+    if (m5LastRssiCheck == 0 || millis() - m5LastRssiCheck > 2000) {
+        m5LastRssiCheck = millis();
+        int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+        if (rssi != m5Rssi) {
+            m5Rssi = rssi;
+            m5Dirty = true;
+        }
+    }
+
+    bool noData = false;
+#ifndef TALLY_TEST_SERVER
+    noData = state == STATE_RUNNING && millis() - atemSwitcher.getLastContact() > M5_NO_DATA_WARNING_MS;
+#endif
+    bool weakSignal = m5Rssi != 0 && m5Rssi < M5_WEAK_SIGNAL_DBM;
+    bool warnPhase = (noData || weakSignal) && (millis() / 400) % 2;
+    if (noData != m5NoData || weakSignal != m5WeakSignal || warnPhase != m5WarnPhase) {
+        if (noData != m5NoData) {
+            Serial.println(noData ? "No data from switcher..." : "Data from switcher resumed");
+        }
+        m5NoData = noData;
+        m5WeakSignal = weakSignal;
+        m5WarnPhase = warnPhase;
+        m5Dirty = true;
+    }
+
+    if (m5LastBatteryCheck == 0 || millis() - m5LastBatteryCheck > 2000) {
+        m5LastBatteryCheck = millis();
+        int mv = M5.Power.getBatteryVoltage();
+        int level = -1;
+        if (mv > 2500) { //No reading without a battery
+            mv += M5_BATTERY_OFFSET_MV;
+            m5BatteryMv = m5BatteryMv == 0 ? mv : m5BatteryMv + (mv - m5BatteryMv) * 0.1f;
+            level = m5BatteryPercent(m5BatteryMv);
+        } else {
+            m5BatteryMv = 0;
+        }
+        //Voltage reads higher while charging, so the level is only a rough estimate then
+        bool charging = M5.Power.isCharging() == m5::Power_Class::is_charging;
+        if (level != m5BatteryLevel || charging != m5Charging) {
+            m5BatteryLevel = level;
+            m5Charging = charging;
+            m5Dirty = true;
+        }
+    }
+
+    if (m5Dirty) {
+        m5Draw();
+    }
+}
+#endif
 
 void onImprovWiFiErrorCb(ImprovTypes::Error err)
 {
@@ -216,6 +574,9 @@ void onImprovWiFiConnectedCb(const char *ssid, const char *password)
 
 //Perform initial setup on power on
 void setup() {
+#ifdef M5STICKC
+    m5Begin();
+#else
     //Init pins for LED
     pinMode(PIN_RED1, OUTPUT);
     pinMode(PIN_GREEN1, OUTPUT);
@@ -224,6 +585,7 @@ void setup() {
     pinMode(PIN_RED2, OUTPUT);
     pinMode(PIN_GREEN2, OUTPUT);
     pinMode(PIN_BLUE2, OUTPUT);
+#endif
 
     setBothLEDs(LED_BLUE);
     //Setup current-measuring pin - Commented out for users without batteries
@@ -237,6 +599,21 @@ void setup() {
     //Read settings from EEPROM. WIFI settings are stored separately by the ESP
     EEPROM.begin(sizeof(settings)); //Needed on ESP8266 module, as EEPROM lib works a bit differently than on a regular Arduino
     EEPROM.get(0, settings);
+
+    //Fresh EEPROM is filled with 0xFF - use sensible defaults instead of garbage.
+    //An empty name also means settings were never saved, as the web form requires a name.
+    if ((uint8_t)settings.tallyName[0] == 0xFF || settings.tallyName[0] == '\0') {
+        settings = Settings();
+        strcpy(settings.tallyName, "Tally");
+        settings.tallyNo = 0;
+        settings.tallyModeLED1 = MODE_NORMAL;
+        settings.tallyModeLED2 = MODE_NORMAL;
+        settings.staticIP = false;
+        settings.neopixelsAmount = 0;
+        settings.neopixelStatusLEDOption = NEOPIXEL_STATUS_LAST;
+        settings.neopixelBrightness = 128;
+        settings.ledBrightness = 255;
+    }
 
     //Ugly fix for IPAddress not loading correctly when read from EEPROM
     settings.tallyIP = IPAddress(settings.tallyIP[0], settings.tallyIP[1], settings.tallyIP[2], settings.tallyIP[3]);
@@ -297,6 +674,17 @@ void setup() {
     Serial.println("Connecting to WiFi...");
     Serial.println("Network name (SSID): " + getSSID());
 
+#ifdef M5STICKC
+    if (M5.Power.getType() == m5::Power_Class::pmic_axp192) {
+        Serial.printf("AXP192 charge control (reg 0x33): 0x%02X -> 0x%02X\n", m5ChargeRegBefore, M5.Power.Axp192.readRegister8(0x33));
+    }
+
+    //LED brightness setting is used for the display. Keep a minimum so the screen never looks dead.
+    M5.Display.setBrightness(max(settings.ledBrightness, (uint8_t)16));
+    m5SetStatus("WiFi...\n" + getSSID());
+    m5Draw();
+#endif
+
     // Initialize and begin HTTP server for handeling the web interface
     server.on("/", handleRoot);
     server.on("/save", handleSave);
@@ -338,6 +726,7 @@ void loop() {
     switch (state) {
         case STATE_CONNECTING_TO_WIFI:
             if (WiFi.status() == WL_CONNECTED) {
+                wifiConnectedOnce = true;
                 WiFi.mode(WIFI_STA); // Disable softAP if connection is successful
                 Serial.println("------------------------");
                 Serial.println("Connected to WiFi:   " + getSSID());
@@ -350,6 +739,9 @@ void loop() {
 #else
                 changeState(STATE_CONNECTING_TO_SWITCHER);
 #endif
+            } else if (firstRun && wifiConnectedOnce) {
+                firstRun = false;
+                Serial.println("Trying to reconnect...");
             } else if (firstRun) {
                 firstRun = false;
                 Serial.println("Unable to connect. Serving \"Tally Light setup\" WiFi for configuration, while still trying to connect...");
@@ -357,6 +749,9 @@ void loop() {
                 WiFi.mode(WIFI_AP_STA); // Enable softAP to access web interface in case of no WiFi
                 setBothLEDs(LED_WHITE);
                 setStatusLED(LED_WHITE);
+#ifdef M5STICKC
+                m5SetStatus("Setup WiFi:\n" DISPLAY_NAME " setup\n" + WiFi.softAPIP().toString());
+#endif
             }
             break;
 #ifndef TALLY_TEST_SERVER
@@ -470,6 +865,10 @@ void loop() {
         neopixelsUpdated = false;
     }
 
+#ifdef M5STICKC
+    m5Loop();
+#endif
+
     //Handle web interface
     server.handleClient();
 }
@@ -483,35 +882,52 @@ void changeState(uint8_t stateToChangeTo) {
             setBothLEDs(LED_BLUE);
             setStatusLED(LED_BLUE);
             setSTRIP(LED_OFF);
+#ifdef M5STICKC
+            m5SetStatus("WiFi...\n" + getSSID());
+#endif
             break;
         case STATE_CONNECTING_TO_SWITCHER:
             state = STATE_CONNECTING_TO_SWITCHER;
             setBothLEDs(LED_PINK);
             setStatusLED(LED_PINK);
             setSTRIP(LED_OFF);
+#ifdef M5STICKC
+            m5SetStatus("ATEM...\n" + settings.switcherIP.toString());
+#endif
             break;
         case STATE_RUNNING:
             state = STATE_RUNNING;
             setBothLEDs(LED_GREEN);
             setStatusLED(LED_ORANGE);
+#ifdef M5STICKC
+            m5SetStatus("");
+#endif
             break;
     }
 }
 
 //Set the color of both LEDs
 void setBothLEDs(uint8_t color) {
-    setLED(color, PIN_RED1, PIN_GREEN1, PIN_BLUE1);
-    setLED(color, PIN_RED2, PIN_GREEN2, PIN_BLUE2);
+    setLED1(color);
+    setLED2(color);
 }
 
-//Set the color of the 1st LED
+//Set the color of the 1st LED (display on M5StickC)
 void setLED1(uint8_t color) {
+#ifdef M5STICKC
+    m5SetColor(color);
+#else
     setLED(color, PIN_RED1, PIN_GREEN1, PIN_BLUE1);
+#endif
 }
 
-//Set the color of the 2nd LED
+//Set the color of the 2nd LED (built-in red LED on M5StickC, lit only for program)
 void setLED2(uint8_t color) {
+#ifdef M5STICKC
+    m5SetBuiltinLed(color == LED_RED);
+#else
     setLED(color, PIN_RED2, PIN_GREEN2, PIN_BLUE2);
+#endif
 }
 
 //Set the color of a LED using the given pins

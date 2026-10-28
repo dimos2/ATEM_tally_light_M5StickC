@@ -105,6 +105,7 @@ class ATEMbase
 	uint16_t getSessionID();
 	
 	bool isConnected();
+	unsigned long getLastContact();
 	bool hasInitialized();
 	bool isRejected();
 
