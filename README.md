@@ -1,6 +1,6 @@
-# ATEM tally light for M5StickC / ESP32
+# ATEM tally light for M5StickC / ESP32 / ESP8266
 
-> **This is a fork** of [AronHetLam/ATEM_tally_light_with_ESP8266](https://github.com/AronHetLam/ATEM_tally_light_with_ESP8266) by Aron N. Het Lam, focused on **ESP32** and the **M5StickC** family (M5StickC / Plus / Plus2). All credit for the original tally light, the tally server and the ATEM integration goes to the original project.
+> **This is a fork** of [AronHetLam/ATEM_tally_light_with_ESP8266](https://github.com/AronHetLam/ATEM_tally_light_with_ESP8266) by Aron N. Het Lam, focused on **ESP32** and the **M5StickC** family (M5StickC / Plus / Plus2), with a tally number button for **ESP8266**. All credit for the original tally light, the tally server and the ATEM integration goes to the original project.
 
 Wireless tally light and 'On Air' sign for Blackmagic ATEM switchers. It connects to the switcher over WiFi and shows the tally state on the M5StickC display, an RGB LED or a Neopixel LED strip.
 
@@ -13,6 +13,7 @@ The tally lights can retransmit tally data to each other, so the switcher only n
 | `ESP32` | Generic ESP32 dev board |
 | `ESP32_C3`, `ESP32_S2`, `ESP32_S3` | ESP32-C3 / S2 / S3 dev boards |
 | `ATOM_Matrix` | M5Stack ATOM Matrix |
+| `ESP8266` | Wemos D1 mini, NodeMCU and other ESP8266 boards |
 
 Each environment also has a `_test_server` variant that simulates a switcher (see [Test server](#test-server)).
 
@@ -70,6 +71,30 @@ Default pins (can be changed with `build_flags` in `platformio.ini`, see the `AT
 | LED 1 red / green / blue | 32 / 33 / 25 |
 | LED 2 red / green / blue | 26 / 27 / 14 |
 | Neopixel data | 12 (4 on ESP32-C3) |
+
+# ESP8266
+Default pins (can be changed with `build_flags` in `platformio.ini`):
+
+| Function | ESP8266 pin |
+|----------|-------------|
+| LED 1 red / green / blue | D0 / D2 / D1 |
+| LED 2 red / green / blue | D4 / D5 / D6 |
+| Neopixel data | D7 |
+| Tally number button | D3 (`TALLY_BUTTON_PIN`) |
+
+### Tally number button
+Connect a push button between **D3** and **GND** (no resistor needed, D3 is pulled up). On NodeMCU the built-in FLASH button can be used. Don't hold the button while powering on, or the ESP8266 starts in flash mode.
+
+| Action | Result |
+|--------|--------|
+| Short press | Blinks the current tally number in green (5 blinks = tally 5) |
+| Hold 1.5 s | The light blinks yellow — release and press as many times as the tally number. Each press lights it white |
+| Wait 3 s after the last press | The number is saved and blinked back in green |
+| Hold again while yellow | Cancels (3 red blinks). Also cancelled after 10 s without any press, or for numbers above 41 |
+
+While the button is in use, the LEDs show the button feedback instead of the tally. The connection to the switcher and the tally server keep running. The number set with the button is the same as on the setup page.
+
+The button is enabled for ESP8266 builds only. To use it on an ESP32 board, add `-D TALLY_BUTTON_PIN=<pin>` to its `build_flags`.
 
 # Status colors
 Color | Description

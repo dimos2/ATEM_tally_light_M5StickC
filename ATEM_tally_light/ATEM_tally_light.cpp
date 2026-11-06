@@ -151,6 +151,12 @@ CRGB color_led[8] = { CRGB::Black, CRGB::Red, CRGB::Lime, CRGB::Blue, CRGB::Yell
 #define TALLY_DATA_PIN    13 // D7
 #endif
 #endif
+//Button for setting the tally number, connected between this pin and GND (ESP8266 only by default).
+//D3 is pulled up on the D1 mini and is the FLASH button on NodeMCU. Don't hold it while powering on, or the ESP enters flash mode.
+#if !defined(TALLY_BUTTON_PIN) && !defined(ESP32)
+#define TALLY_BUTTON_PIN    0  // D3
+#endif
+
 int numTallyLEDs;
 int numStatusLEDs;
 CRGB *leds;
@@ -562,6 +568,137 @@ void m5Loop() {
 }
 #endif
 
+#ifdef TALLY_BUTTON_PIN
+//Hold the button until the light blinks yellow, then press it as many times as the tally number (5 presses = tally 5).
+//The number is saved 3 s after the last press and blinked back in green. Holding it again cancels (3 red blinks).
+//A short press while not entering a number blinks the current tally number in green.
+#define BUTTON_DEBOUNCE_MS      30
+#define BUTTON_HOLD_MS          1500  //Hold this long to start entering a tally number
+#define BUTTON_DONE_MS          3000  //The number is saved this long after the last press
+#define BUTTON_TIMEOUT_MS       10000 //Give up if the button isn't pressed at all after starting
+#define BUTTON_BLINK_ON_MS      300
+#define BUTTON_BLINK_PERIOD_MS  600
+#define BUTTON_BLINK_PAUSE_MS   600   //Dark pause before blinking, so the first blink is easy to count
+
+#define BUTTON_MODE_IDLE        0
+#define BUTTON_MODE_COUNTING    1
+#define BUTTON_MODE_BLINKING    2
+
+uint8_t buttonMode = BUTTON_MODE_IDLE;
+bool buttonRaw = false;
+bool buttonPressed = false;
+bool buttonHoldHandled = false; //A long press has been acted on, so its release isn't a short press
+unsigned long buttonRawChanged = 0;
+unsigned long buttonPressedAt = 0;
+unsigned long buttonLastPress = 0;
+uint8_t buttonCount = 0;
+uint8_t buttonBlinkColor = LED_OFF;
+uint8_t buttonBlinkCount = 0;
+unsigned long buttonBlinkStart = 0;
+
+void buttonStartBlink(uint8_t color, uint8_t count) {
+    buttonMode = BUTTON_MODE_BLINKING;
+    buttonBlinkColor = color;
+    buttonBlinkCount = count;
+    buttonBlinkStart = millis() + BUTTON_BLINK_PAUSE_MS;
+}
+
+void buttonSetLEDs(uint8_t color) {
+    setBothLEDs(color);
+    setSTRIP(color);
+}
+
+//Put back the LED colors for the current state. While running, loop() sets them anyway.
+void buttonRestoreLEDs() {
+    if (state == STATE_CONNECTING_TO_WIFI) {
+        setBothLEDs(WiFi.getMode() & WIFI_AP ? LED_WHITE : LED_BLUE);
+        setSTRIP(LED_OFF);
+    } else if (state == STATE_CONNECTING_TO_SWITCHER) {
+        setBothLEDs(LED_PINK);
+        setSTRIP(LED_OFF);
+    }
+}
+
+//Handle the tally number button. Returns true while it's showing something on the LEDs.
+bool buttonLoop() {
+    unsigned long now = millis();
+
+    bool raw = digitalRead(TALLY_BUTTON_PIN) == LOW;
+    if (raw != buttonRaw) {
+        buttonRaw = raw;
+        buttonRawChanged = now;
+    }
+    bool pressed = false, released = false;
+    if (buttonRaw != buttonPressed && now - buttonRawChanged >= BUTTON_DEBOUNCE_MS) {
+        buttonPressed = buttonRaw;
+        if (buttonPressed) {
+            buttonPressedAt = now;
+            buttonHoldHandled = false;
+            pressed = true;
+        } else {
+            released = true;
+        }
+    }
+    bool held = buttonPressed && !buttonHoldHandled && now - buttonPressedAt >= BUTTON_HOLD_MS;
+    if (held) {
+        buttonHoldHandled = true;
+    }
+
+    if (buttonMode == BUTTON_MODE_COUNTING) {
+        if (held) {
+            Serial.println("Tally number entry cancelled");
+            buttonStartBlink(LED_RED, 3);
+        } else if (pressed) {
+            buttonCount++;
+            buttonLastPress = now;
+        } else if (!buttonPressed && buttonCount > 0 && now - buttonLastPress >= BUTTON_DONE_MS) {
+            if (buttonCount > TALLY_SERVER_MAX_TALLY_FLAGS) {
+                Serial.println("Tally number " + String(buttonCount) + " is out of range");
+                buttonStartBlink(LED_RED, 3);
+            } else {
+                settings.tallyNo = buttonCount - 1;
+                EEPROM.put(0, settings);
+                EEPROM.commit();
+                Serial.println("Tally number set to " + String(buttonCount));
+                buttonStartBlink(LED_GREEN, buttonCount);
+            }
+        } else if (!buttonPressed && buttonCount == 0 && now - buttonLastPress >= BUTTON_TIMEOUT_MS) {
+            Serial.println("Tally number entry timed out");
+            buttonStartBlink(LED_RED, 3);
+        }
+    } else if (held) {
+        Serial.println("Press the button as many times as the tally number");
+        buttonMode = BUTTON_MODE_COUNTING;
+        buttonCount = 0;
+        buttonLastPress = now;
+    } else if (released && !buttonHoldHandled) {
+        buttonStartBlink(LED_GREEN, settings.tallyNo + 1);
+    }
+
+    switch (buttonMode) {
+        case BUTTON_MODE_COUNTING:
+            //Blink yellow while waiting for presses, light up white while the button is down
+            if (buttonPressed && !buttonHoldHandled) {
+                buttonSetLEDs(LED_WHITE);
+            } else {
+                buttonSetLEDs((now / 250) % 2 ? LED_YELLOW : LED_OFF);
+            }
+            return true;
+        case BUTTON_MODE_BLINKING: {
+            long t = now - buttonBlinkStart;
+            if (t >= (long)buttonBlinkCount * BUTTON_BLINK_PERIOD_MS) {
+                buttonMode = BUTTON_MODE_IDLE;
+                buttonRestoreLEDs();
+                return false;
+            }
+            buttonSetLEDs(t >= 0 && t % BUTTON_BLINK_PERIOD_MS < BUTTON_BLINK_ON_MS ? buttonBlinkColor : LED_OFF);
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 void onImprovWiFiErrorCb(ImprovTypes::Error err)
 {
 
@@ -586,8 +723,10 @@ void setup() {
     pinMode(PIN_GREEN2, OUTPUT);
     pinMode(PIN_BLUE2, OUTPUT);
 #endif
+#ifdef TALLY_BUTTON_PIN
+    pinMode(TALLY_BUTTON_PIN, INPUT_PULLUP);
+#endif
 
-    setBothLEDs(LED_BLUE);
     //Setup current-measuring pin - Commented out for users without batteries
     // pinMode(A0, INPUT);
 
@@ -614,6 +753,9 @@ void setup() {
         settings.neopixelBrightness = 128;
         settings.ledBrightness = 255;
     }
+
+    //Light up blue while starting. Done after reading settings, as the LED brightness is 0 until then.
+    setBothLEDs(LED_BLUE);
 
     //Ugly fix for IPAddress not loading correctly when read from EEPROM
     settings.tallyIP = IPAddress(settings.tallyIP[0], settings.tallyIP[1], settings.tallyIP[2], settings.tallyIP[3]);
@@ -723,6 +865,12 @@ void loop() {
         improv.handleByte(readByte);
     }
 
+#ifdef TALLY_BUTTON_PIN
+    bool buttonShowing = buttonLoop();
+#else
+    bool buttonShowing = false;
+#endif
+
     switch (state) {
         case STATE_CONNECTING_TO_WIFI:
             if (WiFi.status() == WL_CONNECTED) {
@@ -815,13 +963,15 @@ void loop() {
             //Handle Tally Server
             tallyServer.runLoop();
 
-            //Set LED and Neopixel colors accordingly
-            int color = getLedColor(settings.tallyModeLED1, settings.tallyNo);
-            setLED1(color);
-            setSTRIP(color);
+            //Set LED and Neopixel colors accordingly, unless the tally number button is using them
+            if (!buttonShowing) {
+                int color = getLedColor(settings.tallyModeLED1, settings.tallyNo);
+                setLED1(color);
+                setSTRIP(color);
 
-            color = getLedColor(settings.tallyModeLED2, settings.tallyNo);
-            setLED2(color);
+                color = getLedColor(settings.tallyModeLED2, settings.tallyNo);
+                setLED2(color);
+            }
 
 #ifndef TALLY_TEST_SERVER
             //Switch state if ATEM connection is lost...
