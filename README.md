@@ -1,19 +1,42 @@
-# ATEM tally light for M5StickC / ESP32 / ESP8266
+# ATEM tally light for ESP8266 / ESP32 / M5StickC
 
-> **This is a fork** of [AronHetLam/ATEM_tally_light_with_ESP8266](https://github.com/AronHetLam/ATEM_tally_light_with_ESP8266) by Aron N. Het Lam, focused on **ESP32** and the **M5StickC** family (M5StickC / Plus / Plus2), with a tally number button for **ESP8266**. All credit for the original tally light, the tally server and the ATEM integration goes to the original project.
+> **This is a fork** of [AronHetLam/ATEM_tally_light_with_ESP8266](https://github.com/AronHetLam/ATEM_tally_light_with_ESP8266) by Aron N. Het Lam. All credit for the original tally light, the tally server and the ATEM integration goes to the original project. This fork adds M5StickC support, a button for setting the tally number and battery monitoring for ESP8266, and a few fixes — see [Changes in this fork](#changes-in-this-fork).
 
-Wireless tally light and 'On Air' sign for Blackmagic ATEM switchers. It connects to the switcher over WiFi and shows the tally state on the M5StickC display, an RGB LED or a Neopixel LED strip.
+Wireless tally light and 'On Air' sign for Blackmagic ATEM switchers. It connects to the switcher over WiFi and shows the tally state on an RGB LED, a Neopixel LED strip or the M5StickC display.
 
-The tally lights can retransmit tally data to each other, so the switcher only needs one connection no matter how many tally lights you use (ATEM switchers allow only 5–8 clients).
+# How it works
+1. On power on the tally light connects to the saved WiFi network (**blue**). If the network can't be found, it also starts a setup access point (**white**).
+2. It connects to the ATEM switcher (**pink**) and receives the tally state of all inputs.
+3. It shows the state of its own input (the tally number): **red** for program, **green** for preview, off otherwise. Other [modes](#modes-of-operation) are available.
+4. Each tally light also acts as a tally server: other tally lights can connect to it instead of the switcher, so the switcher only needs one connection no matter how many tally lights you use (ATEM switchers allow only 5–8 clients).
+
+If the WiFi or switcher connection is lost, the tally light shows the connecting color and reconnects on its own.
+
+# Changes in this fork
+Compared to the original project:
+
+**ESP8266**
+- **Tally number button** — set the tally number without opening the setup page: hold the button, then press it as many times as the tally number. See [Tally number button](#tally-number-button).
+- **Battery monitoring** — measures the battery voltage directly on the cell (one resistor to A0), blinks red 3 times every minute below 3.5 V and shows the voltage on the setup page. See [Battery monitoring](#battery-monitoring).
+
+**M5StickC / Plus / Plus2**
+- New `M5StickC` build: the display shows the tally color and number, buttons change the tally number, WiFi signal and battery level on screen, early connection warnings, charger settings for a large replacement battery. See [M5StickC](#m5stickc).
+
+**All boards**
+- **Setup access point only after power on.** The original starts the "Tally Light setup" access point every time WiFi is lost. This fork starts it only if the network can't be found after power on; when WiFi drops later, the tally light just reconnects. Power cycle it to get back to setup.
+- **Blue light at startup.** The original sets the startup color before reading the settings, while the LED brightness is still 0, so the LED stays dark until WiFi is found. This fork lights it right away.
+- **Defaults on a freshly flashed board** (name "Tally", tally 1, normal mode, full brightness) instead of random values from empty memory.
+
+The extra code takes about 3 KB of flash and 350 bytes of RAM on ESP8266.
 
 # Supported boards
 | PlatformIO environment | Board |
 |------------------------|-------|
+| `ESP8266` | Wemos D1 mini, NodeMCU and other ESP8266 boards |
 | `M5StickC` | M5StickC, M5StickC Plus, M5StickC Plus2 (model detected at runtime) |
 | `ESP32` | Generic ESP32 dev board |
 | `ESP32_C3`, `ESP32_S2`, `ESP32_S3` | ESP32-C3 / S2 / S3 dev boards |
 | `ATOM_Matrix` | M5Stack ATOM Matrix |
-| `ESP8266` | Wemos D1 mini, NodeMCU and other ESP8266 boards |
 
 Each environment also has a `_test_server` variant that simulates a switcher (see [Test server](#test-server)).
 
@@ -21,8 +44,10 @@ Each environment also has a `_test_server` variant that simulates a switcher (se
 Install [PlatformIO](https://platformio.org/) (for example the *PlatformIO IDE* extension for VS Code), open this folder, select the environment and upload, or from the command line:
 
 ```
-pio run -e M5StickC -t upload
+pio run -e ESP8266 -t upload
 ```
+
+Uploading new firmware keeps the saved settings and WiFi network.
 
 # Setup
 On first start (or when the saved WiFi network can't be found after power on) the tally light starts an access point named **"Tally Light setup"**. Connect to it and open [192.168.4.1](http://192.168.4.1) to set:
@@ -33,7 +58,43 @@ On first start (or when the saved WiFi network can't be found after power on) th
 - WiFi network and password, optional static IP
 - ATEM switcher IP — or the IP of another tally light to receive tally data from it
 
-After it has connected to WiFi, the same page is available on the tally light's own IP address. If WiFi is lost later, the tally light keeps reconnecting without starting the access point; power cycle it to get back to setup.
+After it has connected to WiFi, the same page is available on the tally light's own IP address. It also shows the connection status and, on ESP8266 with battery monitoring, the battery voltage.
+
+# ESP8266
+### Wiring
+| Function | Pin |
+|----------|-----|
+| LED 1 red / green / blue | D0 / D2 / D1 |
+| LED 2 red / green / blue | D4 / D5 / D6 |
+| Neopixel data (optional) | D7 |
+| Tally number button | D3 → button → GND |
+| Battery voltage | Battery + → 100 kΩ → A0 |
+
+Pins can be changed with `build_flags` in `platformio.ini` (`PIN_RED1`, `TALLY_DATA_PIN`, `TALLY_BUTTON_PIN`, `TALLY_BATTERY_PIN` …). The button and battery parts are optional: without them the tally light works as usual.
+
+### Tally number button
+Connect a push button between **D3** and **GND** — no resistor needed, D3 is pulled up on the board. On NodeMCU the built-in FLASH button can be used. Don't hold the button while powering on, or the ESP8266 starts in flash mode.
+
+| Action | Result |
+|--------|--------|
+| Short press | Blinks the current tally number in green (5 blinks = tally 5) |
+| Hold 1.5 s | The light blinks yellow — release, then press as many times as the tally number. Each press lights it white |
+| Wait 3 s after the last press | The number is saved and blinked back in green |
+| Hold again while yellow | Cancels with 3 red blinks. Also cancelled after 10 s without any press, or for numbers above 41 |
+
+The number is saved permanently and is the same as on the setup page. While the button is in use, the LEDs show the button feedback instead of the tally; the connection to the switcher and the tally server keep running.
+
+### Battery monitoring
+For a tally light running on a Li-ion cell (for example a phone battery with a charger board and a 5 V boost converter), connect the **battery +** (B+ on the charger board) to **A0** through a **100 kΩ** resistor. The ground is already shared through the charger and converter.
+
+The D1 mini and NodeMCU have a 220k/100k divider on A0; with the extra 100 kΩ the measuring range is 0–4.2 V. In a test it showed 4.14 V with 4.128 V on a multimeter. The resistor draws about 13 µA.
+
+- The voltage is measured every second and smoothed, so WiFi transmit spikes don't cause false warnings.
+- At or below **3.5 V** the light **blinks red 3 times every minute**. The warning stops above 3.6 V (when charging).
+- The setup page shows the voltage ("Battery voltage", with "(low)" when low), and it is logged to the serial port every minute.
+- With nothing connected A0 reads 0 V and battery monitoring is off.
+
+A 1 MΩ resistor works too, less precisely: build with `-D BATTERY_FULL_SCALE_V=13.2`. To calibrate, compare the setup page with a multimeter and adjust `BATTERY_FULL_SCALE_V` (voltage at full scale) in proportion.
 
 # M5StickC
 ### Display
@@ -72,29 +133,7 @@ Default pins (can be changed with `build_flags` in `platformio.ini`, see the `AT
 | LED 2 red / green / blue | 26 / 27 / 14 |
 | Neopixel data | 12 (4 on ESP32-C3) |
 
-# ESP8266
-Default pins (can be changed with `build_flags` in `platformio.ini`):
-
-| Function | ESP8266 pin |
-|----------|-------------|
-| LED 1 red / green / blue | D0 / D2 / D1 |
-| LED 2 red / green / blue | D4 / D5 / D6 |
-| Neopixel data | D7 |
-| Tally number button | D3 (`TALLY_BUTTON_PIN`) |
-
-### Tally number button
-Connect a push button between **D3** and **GND** (no resistor needed, D3 is pulled up). On NodeMCU the built-in FLASH button can be used. Don't hold the button while powering on, or the ESP8266 starts in flash mode.
-
-| Action | Result |
-|--------|--------|
-| Short press | Blinks the current tally number in green (5 blinks = tally 5) |
-| Hold 1.5 s | The light blinks yellow — release and press as many times as the tally number. Each press lights it white |
-| Wait 3 s after the last press | The number is saved and blinked back in green |
-| Hold again while yellow | Cancels (3 red blinks). Also cancelled after 10 s without any press, or for numbers above 41 |
-
-While the button is in use, the LEDs show the button feedback instead of the tally. The connection to the switcher and the tally server keep running. The number set with the button is the same as on the setup page.
-
-The button is enabled for ESP8266 builds only. To use it on an ESP32 board, add `-D TALLY_BUTTON_PIN=<pin>` to its `build_flags`.
+The tally number button and battery monitoring are ESP8266-only by default. The button can be enabled on ESP32 with `-D TALLY_BUTTON_PIN=<pin>`.
 
 # Status colors
 Color | Description
@@ -106,6 +145,15 @@ RED | Tally program
 GREEN | Tally preview
 OFF | Tally neither in program nor preview
 ORANGE | Connected and running (only shown by the status LED on a Neopixel strip)
+
+Short blinks on ESP8266:
+
+Blinks | Description
+-------|------------
+YELLOW, continuous | Waiting for tally number button presses
+GREEN × N | Tally number N (after a short press, or saved after entering it)
+RED × 3 | Tally number entry cancelled
+RED × 3, every minute | Battery at or below 3.5 V
 
 # Modes of operation
 Mode | Description

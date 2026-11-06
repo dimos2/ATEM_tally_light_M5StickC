@@ -157,6 +157,11 @@ CRGB color_led[8] = { CRGB::Black, CRGB::Red, CRGB::Lime, CRGB::Blue, CRGB::Yell
 #define TALLY_BUTTON_PIN    0  // D3
 #endif
 
+//Battery voltage input, see batteryLoop() (ESP8266 only by default)
+#if !defined(TALLY_BATTERY_PIN) && !defined(ESP32)
+#define TALLY_BATTERY_PIN   A0
+#endif
+
 int numTallyLEDs;
 int numStatusLEDs;
 CRGB *leds;
@@ -568,6 +573,56 @@ void m5Loop() {
 }
 #endif
 
+#ifndef M5STICKC
+//Blink the LEDs and strip a number of times, then go back to normal. Used by the tally number button and the battery warning.
+#define BLINK_ON_MS     300
+#define BLINK_PERIOD_MS 600
+#define BLINK_PAUSE_MS  600 //Dark pause before blinking, so the first blink is easy to count
+
+bool blinkActive = false;
+uint8_t blinkColor = LED_OFF;
+uint8_t blinkCount = 0;
+unsigned long blinkStartedAt = 0;
+
+void setAllLEDs(uint8_t color) {
+    setBothLEDs(color);
+    setSTRIP(color);
+}
+
+//Put back the LED colors for the current state. While running, loop() sets them anyway.
+void restoreStateLEDs() {
+    if (state == STATE_CONNECTING_TO_WIFI) {
+        setBothLEDs(WiFi.getMode() & WIFI_AP ? LED_WHITE : LED_BLUE);
+        setSTRIP(LED_OFF);
+    } else if (state == STATE_CONNECTING_TO_SWITCHER) {
+        setBothLEDs(LED_PINK);
+        setSTRIP(LED_OFF);
+    }
+}
+
+void blinkStart(uint8_t color, uint8_t count) {
+    blinkActive = true;
+    blinkColor = color;
+    blinkCount = count;
+    blinkStartedAt = millis() + BLINK_PAUSE_MS;
+}
+
+//Returns true while blinking
+bool blinkLoop() {
+    if (!blinkActive) {
+        return false;
+    }
+    long t = millis() - blinkStartedAt;
+    if (t >= (long)blinkCount * BLINK_PERIOD_MS) {
+        blinkActive = false;
+        restoreStateLEDs();
+        return false;
+    }
+    setAllLEDs(t >= 0 && t % BLINK_PERIOD_MS < BLINK_ON_MS ? blinkColor : LED_OFF);
+    return true;
+}
+#endif
+
 #ifdef TALLY_BUTTON_PIN
 //Hold the button until the light blinks yellow, then press it as many times as the tally number (5 presses = tally 5).
 //The number is saved 3 s after the last press and blinked back in green. Holding it again cancels (3 red blinks).
@@ -576,15 +631,8 @@ void m5Loop() {
 #define BUTTON_HOLD_MS          1500  //Hold this long to start entering a tally number
 #define BUTTON_DONE_MS          3000  //The number is saved this long after the last press
 #define BUTTON_TIMEOUT_MS       10000 //Give up if the button isn't pressed at all after starting
-#define BUTTON_BLINK_ON_MS      300
-#define BUTTON_BLINK_PERIOD_MS  600
-#define BUTTON_BLINK_PAUSE_MS   600   //Dark pause before blinking, so the first blink is easy to count
 
-#define BUTTON_MODE_IDLE        0
-#define BUTTON_MODE_COUNTING    1
-#define BUTTON_MODE_BLINKING    2
-
-uint8_t buttonMode = BUTTON_MODE_IDLE;
+bool buttonCounting = false;
 bool buttonRaw = false;
 bool buttonPressed = false;
 bool buttonHoldHandled = false; //A long press has been acted on, so its release isn't a short press
@@ -592,31 +640,10 @@ unsigned long buttonRawChanged = 0;
 unsigned long buttonPressedAt = 0;
 unsigned long buttonLastPress = 0;
 uint8_t buttonCount = 0;
-uint8_t buttonBlinkColor = LED_OFF;
-uint8_t buttonBlinkCount = 0;
-unsigned long buttonBlinkStart = 0;
 
-void buttonStartBlink(uint8_t color, uint8_t count) {
-    buttonMode = BUTTON_MODE_BLINKING;
-    buttonBlinkColor = color;
-    buttonBlinkCount = count;
-    buttonBlinkStart = millis() + BUTTON_BLINK_PAUSE_MS;
-}
-
-void buttonSetLEDs(uint8_t color) {
-    setBothLEDs(color);
-    setSTRIP(color);
-}
-
-//Put back the LED colors for the current state. While running, loop() sets them anyway.
-void buttonRestoreLEDs() {
-    if (state == STATE_CONNECTING_TO_WIFI) {
-        setBothLEDs(WiFi.getMode() & WIFI_AP ? LED_WHITE : LED_BLUE);
-        setSTRIP(LED_OFF);
-    } else if (state == STATE_CONNECTING_TO_SWITCHER) {
-        setBothLEDs(LED_PINK);
-        setSTRIP(LED_OFF);
-    }
+void buttonStopCounting(uint8_t blinkColor, uint8_t blinkCount) {
+    buttonCounting = false;
+    blinkStart(blinkColor, blinkCount);
 }
 
 //Handle the tally number button. Returns true while it's showing something on the LEDs.
@@ -644,58 +671,102 @@ bool buttonLoop() {
         buttonHoldHandled = true;
     }
 
-    if (buttonMode == BUTTON_MODE_COUNTING) {
+    if (buttonCounting) {
         if (held) {
             Serial.println("Tally number entry cancelled");
-            buttonStartBlink(LED_RED, 3);
+            buttonStopCounting(LED_RED, 3);
         } else if (pressed) {
             buttonCount++;
             buttonLastPress = now;
         } else if (!buttonPressed && buttonCount > 0 && now - buttonLastPress >= BUTTON_DONE_MS) {
             if (buttonCount > TALLY_SERVER_MAX_TALLY_FLAGS) {
                 Serial.println("Tally number " + String(buttonCount) + " is out of range");
-                buttonStartBlink(LED_RED, 3);
+                buttonStopCounting(LED_RED, 3);
             } else {
                 settings.tallyNo = buttonCount - 1;
                 EEPROM.put(0, settings);
                 EEPROM.commit();
                 Serial.println("Tally number set to " + String(buttonCount));
-                buttonStartBlink(LED_GREEN, buttonCount);
+                buttonStopCounting(LED_GREEN, buttonCount);
             }
         } else if (!buttonPressed && buttonCount == 0 && now - buttonLastPress >= BUTTON_TIMEOUT_MS) {
             Serial.println("Tally number entry timed out");
-            buttonStartBlink(LED_RED, 3);
+            buttonStopCounting(LED_RED, 3);
         }
     } else if (held) {
         Serial.println("Press the button as many times as the tally number");
-        buttonMode = BUTTON_MODE_COUNTING;
+        buttonCounting = true;
         buttonCount = 0;
         buttonLastPress = now;
+        blinkActive = false;
     } else if (released && !buttonHoldHandled) {
-        buttonStartBlink(LED_GREEN, settings.tallyNo + 1);
+        blinkStart(LED_GREEN, settings.tallyNo + 1);
     }
 
-    switch (buttonMode) {
-        case BUTTON_MODE_COUNTING:
-            //Blink yellow while waiting for presses, light up white while the button is down
-            if (buttonPressed && !buttonHoldHandled) {
-                buttonSetLEDs(LED_WHITE);
-            } else {
-                buttonSetLEDs((now / 250) % 2 ? LED_YELLOW : LED_OFF);
-            }
-            return true;
-        case BUTTON_MODE_BLINKING: {
-            long t = now - buttonBlinkStart;
-            if (t >= (long)buttonBlinkCount * BUTTON_BLINK_PERIOD_MS) {
-                buttonMode = BUTTON_MODE_IDLE;
-                buttonRestoreLEDs();
-                return false;
-            }
-            buttonSetLEDs(t >= 0 && t % BUTTON_BLINK_PERIOD_MS < BUTTON_BLINK_ON_MS ? buttonBlinkColor : LED_OFF);
-            return true;
+    if (buttonCounting) {
+        //Blink yellow while waiting for presses, light up white while the button is down
+        if (buttonPressed && !buttonHoldHandled) {
+            setAllLEDs(LED_WHITE);
+        } else {
+            setAllLEDs((now / 250) % 2 ? LED_YELLOW : LED_OFF);
         }
     }
-    return false;
+    return buttonCounting;
+}
+#endif
+
+#ifdef TALLY_BATTERY_PIN
+//Battery voltage, measured directly on the cell. The D1 mini and NodeMCU have a 220k/100k divider on A0 (3.2 V at full scale),
+//so connect battery + to A0 through an extra 100k resistor for 4.2 V at full scale ((100k + 220k + 100k) / 100k * 1 V).
+//A 1M resistor works too, less precisely: build with -D BATTERY_FULL_SCALE_V=13.2. A 100nF capacitor from A0 to GND steadies the reading.
+//Below 3.5 V the light blinks red 3 times every minute. A0 reads 0 V with nothing connected, which disables the warning.
+#ifndef BATTERY_FULL_SCALE_V
+#define BATTERY_FULL_SCALE_V        4.2  //Battery voltage at an A0 reading of 1023. Adjust to calibrate against a multimeter
+#endif
+#define BATTERY_LOW_V               3.5 //Warn at or below this
+#define BATTERY_OK_V                3.6 //Stop warning above this (charging), so it doesn't toggle around 3.5 V
+#define BATTERY_MIN_V               2.5 //Below this no battery is connected
+#define BATTERY_READ_INTERVAL_MS    1000
+#define BATTERY_WARNING_INTERVAL_MS 60000
+
+float batteryVoltage = 0; //Smoothed, WiFi transmit spikes make single readings jump
+bool batteryLow = false;
+unsigned long batteryLastRead = 0;
+unsigned long batteryLastWarning = 0;
+unsigned long batteryLastLog = 0;
+
+bool batteryConnected() {
+    return batteryVoltage >= BATTERY_MIN_V;
+}
+
+//Measure the battery and start the low battery warning. ledsBusy: something else is showing on the LEDs.
+void batteryLoop(bool ledsBusy) {
+    unsigned long now = millis();
+    if (batteryLastRead && now - batteryLastRead < BATTERY_READ_INTERVAL_MS) {
+        return;
+    }
+    batteryLastRead = now;
+
+    float voltage = analogRead(TALLY_BATTERY_PIN) * BATTERY_FULL_SCALE_V / 1023;
+    batteryVoltage = batteryVoltage == 0 ? voltage : batteryVoltage * 0.9 + voltage * 0.1;
+
+    if (!batteryLow && batteryConnected() && batteryVoltage <= BATTERY_LOW_V) {
+        batteryLow = true;
+        batteryLastWarning = now - BATTERY_WARNING_INTERVAL_MS; //Warn right away
+        Serial.println("Battery low: " + String(batteryVoltage, 2) + " V");
+    } else if (batteryLow && (!batteryConnected() || batteryVoltage >= BATTERY_OK_V)) {
+        batteryLow = false;
+    }
+
+    if (batteryLow && !ledsBusy && !blinkActive && now - batteryLastWarning >= BATTERY_WARNING_INTERVAL_MS) {
+        batteryLastWarning = now;
+        blinkStart(LED_RED, 3);
+    }
+
+    if (batteryConnected() && now - batteryLastLog >= 60000) {
+        batteryLastLog = now;
+        Serial.println("Battery: " + String(batteryVoltage, 2) + " V");
+    }
 }
 #endif
 
@@ -865,10 +936,16 @@ void loop() {
         improv.handleByte(readByte);
     }
 
+    //Tally number button and battery warning can take over the LEDs for a moment
+    bool ledsBusy = false;
 #ifdef TALLY_BUTTON_PIN
-    bool buttonShowing = buttonLoop();
-#else
-    bool buttonShowing = false;
+    ledsBusy = buttonLoop();
+#endif
+#ifdef TALLY_BATTERY_PIN
+    batteryLoop(ledsBusy);
+#endif
+#ifndef M5STICKC
+    ledsBusy |= blinkLoop();
 #endif
 
     switch (state) {
@@ -963,8 +1040,8 @@ void loop() {
             //Handle Tally Server
             tallyServer.runLoop();
 
-            //Set LED and Neopixel colors accordingly, unless the tally number button is using them
-            if (!buttonShowing) {
+            //Set LED and Neopixel colors accordingly, unless the tally number button or battery warning is using them
+            if (!ledsBusy) {
                 int color = getLedColor(settings.tallyModeLED1, settings.tallyNo);
                 setLED1(color);
                 setSTRIP(color);
@@ -1297,10 +1374,11 @@ void handleRoot() {
     html += "</td></tr><tr><td><br></td></tr><tr><td>Signal strength:</td><td colspan=\"2\">";
     html += WiFi.RSSI();
     html += " dBm</td></tr>";
-    //Commented out for users without batteries
-    // html += "<tr><td><br></td></tr><tr><td>Battery voltage:</td><td colspan=\"2\">";
-    // html += dtostrf(uBatt, 0, 3, buffer);
-    // html += " V</td></tr>";
+#ifdef TALLY_BATTERY_PIN
+    html += "<tr><td><br></td></tr><tr><td>Battery voltage:</td><td colspan=\"2\">";
+    html += batteryConnected() ? String(batteryVoltage, 2) + " V" + (batteryLow ? " (low)" : "") : "Not connected";
+    html += "</td></tr>";
+#endif
     html += "<tr><td>Static IP:</td><td colspan=\"2\">";
     html += settings.staticIP == true ? "True" : "False";
     html += "</td></tr><tr><td>" +
